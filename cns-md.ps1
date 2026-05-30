@@ -136,38 +136,148 @@ else {
 
 $audioExts = @("mp3", "flac", "aac", "ogg", "wav", "opus", "m4a", "wma", "vorbis")
 
-function Run-Download($url, $format, $resolution, $ffmpegLoc) {
-    $ytdlp  = "$ScriptDir\yt-dlp.exe"
-    $output = "dl/%(title)s.%(ext)s"
-
+function Build-DlArgs($format, $resolution, $ffmpegLoc, $outputTemplate) {
     $resCap    = if ($resolution) { "[height<=$resolution]" } else { "" }
     $mp4Format = "bestvideo[vcodec^=avc1]$resCap+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc1]$resCap+bestaudio/bestvideo$resCap+bestaudio/best"
 
-    Write-Host ""
-
-    $args = @()
-    if ($ffmpegLoc) {
-        $args += "--ffmpeg-location", $ffmpegLoc
-    }
+    $dlArgs = @()
+    if ($ffmpegLoc) { $dlArgs += "--ffmpeg-location", $ffmpegLoc }
 
     if ($format -eq "mp4") {
-        $args += "--merge-output-format", "mp4", "-f", $mp4Format
+        $dlArgs += "--merge-output-format", "mp4", "-f", $mp4Format
     } elseif ($format -eq "mp3") {
-        $args += "-x", "--audio-format", "mp3", "--embed-thumbnail", "--add-metadata"
+        $dlArgs += "-x", "--audio-format", "mp3", "--embed-thumbnail", "--add-metadata"
     } elseif ($audioExts -contains $format) {
-        $args += "-x", "--audio-format", $format, "--add-metadata"
+        $dlArgs += "-x", "--audio-format", $format, "--add-metadata"
     } else {
-        $args += "--remux-video", $format, "-f", "bestvideo[vcodec^=avc1]+bestaudio/best"
+        $dlArgs += "--remux-video", $format, "-f", "bestvideo[vcodec^=avc1]+bestaudio/best"
     }
 
-    $args += "--windows-filenames", "-o", $output, $url
+    $dlArgs += "--windows-filenames", "-o", $outputTemplate
+    return $dlArgs
+}
 
-    & $ytdlp $args
+function Run-Download($url, $format, $resolution, $ffmpegLoc) {
+    $ytdlp    = "$ScriptDir\yt-dlp.exe"
+    $baseArgs = Build-DlArgs $format $resolution $ffmpegLoc "dl/%(title)s.%(ext)s"
+
+    Write-Host ""
+    & $ytdlp ($baseArgs + @($url))
 
     if ($LASTEXITCODE -ne 0) {
         Write-Err "Download failed (exit code $LASTEXITCODE)."
     } else {
         Write-Ok "Done! File saved to the dl\ folder."
+    }
+}
+
+function Get-PlaylistEntries($url) {
+    $ytdlp = "$ScriptDir\yt-dlp.exe"
+    Write-Status "Fetching info..."
+    $lines = & $ytdlp --flat-playlist --print "%(url)s`t%(title)s" --quiet $url 2>$null
+    if (-not $lines) { return @() }
+    return @($lines) | ForEach-Object {
+        $parts = $_ -split "`t", 2
+        [PSCustomObject]@{
+            Url   = $parts[0]
+            Title = if ($parts.Count -gt 1 -and $parts[1]) { $parts[1] } else { $parts[0] }
+        }
+    }
+}
+
+function Invoke-PlaylistDownload($entries, $baseArgs) {
+    $ytdlp    = "$ScriptDir\yt-dlp.exe"
+    $logDir   = "$ScriptDir\logs"
+    $maxConc  = 10
+    $dailyLog = "$logDir\$(Get-Date -Format 'yyyy-MM-dd').log"
+
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+
+    $total   = $entries.Count
+    $queue   = [System.Collections.Generic.Queue[object]]::new()
+    $idx     = 0
+    foreach ($e in $entries) { $idx++; $queue.Enqueue(@{ Entry = $e; Index = $idx }) }
+
+    $running = @()
+    $done    = 0
+    $failed  = 0
+
+    Write-Host ""
+
+    while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+        while ($running.Count -lt $maxConc -and $queue.Count -gt 0) {
+            $item    = $queue.Dequeue()
+            $e       = $item.Entry
+            $i       = $item.Index
+            $outLog  = "$logDir\_tmp_$i.txt"
+            $errLog  = "$logDir\_tmp_${i}_err.txt"
+            $paddedIdx = $i.ToString('D3')
+            $allArgs   = @()
+            $skipNext  = $false
+            foreach ($arg in $baseArgs) {
+                if ($skipNext) { $allArgs += "dl/${paddedIdx}_%(title)s.%(ext)s"; $skipNext = $false; continue }
+                if ($arg -eq '-o') { $allArgs += $arg; $skipNext = $true; continue }
+                $allArgs += $arg
+            }
+            $allArgs += $e.Url
+            try {
+                $proc = Start-Process -FilePath $ytdlp -ArgumentList $allArgs `
+                    -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
+                    -NoNewWindow -PassThru
+                $running += @{ Proc = $proc; Index = $i; Title = $e.Title; OutLog = $outLog; ErrLog = $errLog }
+            } catch {
+                Write-Host ("`r  [FAIL] $i. $($e.Title)" + (" " * 20)) -ForegroundColor Red
+                $failed++
+            }
+        }
+
+        $stillRunning = @()
+        foreach ($job in $running) {
+            if ($job.Proc.HasExited) {
+                $exitCode     = try { $job.Proc.ExitCode } catch { -1 }
+                $hasRealError = $false
+                if ($exitCode -ne 0) {
+                    $errContent   = if (Test-Path $job.ErrLog) { Get-Content $job.ErrLog -Raw -ErrorAction SilentlyContinue } else { "" }
+                    $hasRealError = $errContent -match '(?m)^ERROR:'
+                }
+
+                $sep = "=" * 60
+                Add-Content -Path $dailyLog -Value "`n$sep`n[$($job.Index)] $($job.Title)`n$sep"
+                if (Test-Path $job.OutLog) { Get-Content $job.OutLog | Add-Content $dailyLog; Remove-Item $job.OutLog -Force }
+                if (Test-Path $job.ErrLog) {
+                    Add-Content -Path $dailyLog -Value "--- stderr ---"
+                    Get-Content $job.ErrLog | Add-Content $dailyLog
+                    Remove-Item $job.ErrLog -Force
+                }
+
+                if (-not $hasRealError) {
+                    $done++
+                    Write-Host ("`r  [OK]   $($job.Index). $($job.Title)" + (" " * 20)) -ForegroundColor Green
+                } else {
+                    $failed++
+                    Write-Host ("`r  [FAIL] $($job.Index). $($job.Title)  (see $dailyLog)" + (" " * 5)) -ForegroundColor Red
+                }
+            } else {
+                $stillRunning += $job
+            }
+        }
+        $running = $stillRunning
+
+        $completed  = $done + $failed
+        $pct        = if ($total -gt 0) { [int](($completed / $total) * 20) } else { 0 }
+        $bar        = ("#" * $pct) + ("-" * (20 - $pct))
+        $statusLine = "  [$bar] $completed/$total  |  $($running.Count) running  |  $failed failed  |  $($queue.Count) queued"
+        Write-Host "`r$statusLine" -NoNewline -ForegroundColor Cyan
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    Write-Host ""
+    Write-Host ""
+    if ($failed -eq 0) {
+        Write-Ok "All $total video(s) downloaded successfully!"
+    } else {
+        Write-Ok "$done/$total downloaded. $failed failed. Full log: $dailyLog"
     }
 }
 
@@ -226,5 +336,14 @@ while ($true) {
     if ($url -eq "") { Write-Err "No URL entered."; continue }
 
     Set-Location $ScriptDir
-    Run-Download $url $format $resolution $ffmpegLocation
+
+    $entries = Get-PlaylistEntries $url
+
+    if ($entries.Count -gt 1) {
+        Write-Ok "Detected playlist: $($entries.Count) videos"
+        $baseArgs = Build-DlArgs $format $resolution $ffmpegLocation "dl/%(title)s.%(ext)s"
+        Invoke-PlaylistDownload $entries $baseArgs
+    } else {
+        Run-Download $url $format $resolution $ffmpegLocation
+    }
 }
